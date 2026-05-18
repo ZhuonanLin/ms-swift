@@ -332,6 +332,9 @@ class MegatronTunerMixin:
     freeze_llm: bool = False
     freeze_vit: bool = True
     freeze_aligner: bool = True
+    train_new_vocab_only: bool = False
+    vocab_extension_original_vocab_size: Optional[int] = None
+    vocab_extension_init_strategy: Literal['random', 'mean'] = 'random'
     # full
     freeze_parameters: List[str] = field(default_factory=list)
     freeze_parameters_regex: Optional[str] = None
@@ -354,6 +357,10 @@ class MegatronTunerMixin:
     def __post_init__(self):
         if 0 < self.freeze_parameters_ratio < 1 and self.pipeline_model_parallel_size > 1:
             raise ValueError('`freeze_parameters_ratio` is not supported when `pipeline_model_parallel_size` > 1')
+        if self.train_new_vocab_only and self.tuner_type != 'full':
+            raise ValueError('`train_new_vocab_only` requires `tuner_type=full`.')
+        if self.train_new_vocab_only and not self.new_special_tokens:
+            raise ValueError('`train_new_vocab_only` requires `new_special_tokens` to be set.')
         if self.target_regex:
             self.target_modules = self.target_regex
 

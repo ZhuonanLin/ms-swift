@@ -179,11 +179,40 @@ def _prepare_full_vit(args, model):
             module.requires_grad_(True)
 
 
+def _get_vocab_extension_modules(model):
+    lm_model = model.language_model if hasattr(model, 'language_model') else model
+    modules = []
+    input_embeddings = deep_getattr(lm_model, 'embedding.word_embeddings')
+    if input_embeddings is not None:
+        modules.append(('embedding.word_embeddings', input_embeddings))
+    output_layer = deep_getattr(lm_model, 'output_layer')
+    if output_layer is not None and not getattr(lm_model, 'share_embeddings_and_output_weights', False):
+        modules.append(('output_layer', output_layer))
+    return modules
+
+
+def _prepare_full_vocab_extension(args, model):
+    for _, param in model.named_parameters():
+        param.requires_grad = False
+
+    modules = _get_vocab_extension_modules(model)
+    if not modules:
+        raise ValueError('`train_new_vocab_only` is enabled but no embedding/output modules were found.')
+
+    trainable_names = []
+    for module_name, module in modules:
+        module.weight.requires_grad = True
+        trainable_names.append(f'{module_name}.weight')
+    logger.info(f'train_new_vocab_only=True, trainable_parameters={trainable_names}')
+
+
 def prepare_mcore_model(args, model):
     if args.tuner_type == 'full':
         freeze_parameters(model, args.freeze_parameters_ratio, args.freeze_parameters, args.freeze_parameters_regex)
         if args.trainable_parameters or args.trainable_parameters_regex:
             activate_parameters(model, args.trainable_parameters, args.trainable_parameters_regex)
+        if args.train_new_vocab_only:
+            _prepare_full_vocab_extension(args, model)
     elif args.tuner_type in {'lora', 'lora_llm'}:
         model = prepare_adapter(args, model)
         if args.tuner_type == 'lora_llm':

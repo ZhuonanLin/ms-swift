@@ -83,6 +83,7 @@ class BaseMegatronTrainer(ABC):
             for m in self.unwrapped_models:
                 self._initialize_embedding(m)
         self._load_checkpoint()
+        self._setup_vocab_extension_warmup()
 
         self.eval_metrics = None
         if args.check_model and hasattr(args, 'model_dir'):
@@ -227,7 +228,8 @@ class BaseMegatronTrainer(ABC):
         }
         config = config_cls(**kwargs)
 
-        if args.apply_wd_to_qk_layernorm or self.args.vit_lr is not None or self.args.aligner_lr is not None:
+        if (args.apply_wd_to_qk_layernorm or self.args.vit_lr is not None or self.args.aligner_lr is not None
+                or args.train_new_vocab_only):
             param_groups_context = self._patch_get_param_groups()
         else:
             param_groups_context = nullcontext()
@@ -298,6 +300,7 @@ class BaseMegatronTrainer(ABC):
             min_lr=config.min_lr,
             decoupled_lr=config.decoupled_lr,
             decoupled_min_lr=config.decoupled_min_lr,
+            default_skip_embedding_weight_decay=self.args.train_new_vocab_only,
         )
 
     # Code borrowed from Megatron-LM
@@ -362,6 +365,9 @@ class BaseMegatronTrainer(ABC):
 
                 if no_weight_decay_cond is not None:
                     no_wd: bool = no_weight_decay_cond(name, param)
+                elif args.train_new_vocab_only and name.endswith(('embedding.word_embeddings.weight',
+                                                                  'output_layer.weight')):
+                    no_wd = True
                 elif args.apply_wd_to_qk_layernorm and any(
                         name.endswith(k) for k in ['q_layernorm.weight', 'k_layernorm.weight']):
                     no_wd = False
@@ -496,6 +502,79 @@ class BaseMegatronTrainer(ABC):
 
         return iteration
 
+    def _get_vocab_extension_sizes(self) -> tuple[int, int]:
+        args = self.args
+        tokenizer = self.template.tokenizer
+        effective_vocab_size = len(tokenizer)
+        original_vocab_size = args.vocab_extension_original_vocab_size
+        if original_vocab_size is None:
+            num_new_tokens = len(list(dict.fromkeys(args.new_special_tokens or [])))
+            original_vocab_size = effective_vocab_size - num_new_tokens
+        if not 0 <= original_vocab_size <= effective_vocab_size:
+            raise ValueError(
+                f'Invalid vocab extension sizes: original_vocab_size={original_vocab_size}, '
+                f'effective_vocab_size={effective_vocab_size}')
+        return original_vocab_size, effective_vocab_size
+
+    @staticmethod
+    def _get_vocab_extension_modules(model):
+        if hasattr(model, 'language_model'):
+            model = model.language_model
+        modules = []
+        input_embeddings = deep_getattr(model, 'embedding.word_embeddings')
+        if input_embeddings is not None:
+            modules.append(('embedding.word_embeddings', input_embeddings))
+        output_layer = deep_getattr(model, 'output_layer')
+        if output_layer is not None and not model.share_embeddings_and_output_weights:
+            modules.append(('output_layer', output_layer))
+        return modules
+
+    def _register_vocab_extension_hook(self, module_name: str, module, original_vocab_size: int,
+                                       effective_vocab_size: int) -> None:
+        if getattr(module.weight, '_vocab_ext_hook_registered', False):
+            return
+
+        local_rows = module.weight.shape[0]
+        tp_rank = mpu.get_tensor_model_parallel_rank() if torch.distributed.is_initialized() else 0
+        global_start = tp_rank * local_rows
+        global_rows = torch.arange(global_start, global_start + local_rows, device=module.weight.device)
+        trainable_rows = (global_rows >= original_vocab_size) & (global_rows < effective_vocab_size)
+        trainable_count = int(trainable_rows.sum().item())
+
+        if trainable_count == 0:
+            logger.info_if(
+                f'No trainable vocab-extension rows on this rank for {module_name}: '
+                f'global_range=[{global_start}, {global_start + local_rows}), '
+                f'trainable_range=[{original_vocab_size}, {effective_vocab_size})',
+                cond=mpu.get_data_parallel_rank() == 0)
+
+        trainable_mask = trainable_rows.to(dtype=module.weight.dtype).unsqueeze(-1)
+
+        def _mask_grad(grad):
+            return grad * trainable_mask
+
+        module.weight.register_hook(_mask_grad)
+        module.weight._vocab_ext_hook_registered = True
+        logger.info_if(
+            f'Vocab-extension hook registered on {module_name}: '
+            f'global_range=[{global_start}, {global_start + local_rows}), '
+            f'trainable_rows={trainable_count}, '
+            f'trainable_range=[{original_vocab_size}, {effective_vocab_size})',
+            cond=mpu.get_data_parallel_rank() == 0)
+
+    def _setup_vocab_extension_warmup(self) -> None:
+        args = self.args
+        if not args.train_new_vocab_only:
+            return
+        original_vocab_size, effective_vocab_size = self._get_vocab_extension_sizes()
+        logger.info_if(
+            f'train_new_vocab_only=True, original_vocab_size={original_vocab_size}, '
+            f'effective_vocab_size={effective_vocab_size}',
+            cond=mpu.get_data_parallel_rank() == 0)
+        for model in self.unwrapped_models:
+            for module_name, module in self._get_vocab_extension_modules(model):
+                self._register_vocab_extension_hook(module_name, module, original_vocab_size, effective_vocab_size)
+
     def _prepare_vit_gradient_checkpointing(self, model):
         visual = model.visual
         if visual is None:
@@ -510,10 +589,14 @@ class BaseMegatronTrainer(ABC):
                 except AttributeError:
                     pass
 
-    @staticmethod
-    def _initialize_embedding(model):
+    def _initialize_embedding(self, model):
         # compat new_special_tokens
+        args = self.args
         init_method = model.config.init_method
+        original_vocab_size = None
+        effective_vocab_size = None
+        if args.new_special_tokens and args.vocab_extension_init_strategy == 'mean':
+            original_vocab_size, effective_vocab_size = self._get_vocab_extension_sizes()
         if hasattr(model, 'language_model'):
             model = model.language_model
         for key in ['embedding.word_embeddings', 'output_layer']:
@@ -527,8 +610,29 @@ class BaseMegatronTrainer(ABC):
             if num_to_initialize == 0:
                 continue
             logger.info_if(f'num_to_initialize: {num_to_initialize}', cond=mpu.get_data_parallel_rank() == 0)
-            tensor = module.weight.new_empty(num_to_initialize, module.weight.shape[1])
-            module.weight.data[initialize_mask] = init_method(tensor)
+            if original_vocab_size is not None and effective_vocab_size is not None:
+                local_rows = module.weight.shape[0]
+                tp_rank = mpu.get_tensor_model_parallel_rank() if torch.distributed.is_initialized() else 0
+                global_start = tp_rank * local_rows
+                global_rows = torch.arange(global_start, global_start + local_rows, device=module.weight.device)
+                original_rows = global_rows < original_vocab_size
+                local_count = original_rows.sum().to(dtype=torch.long)
+                local_sum = module.weight[original_rows].sum(dim=0) if local_count.item() > 0 else module.weight.new_zeros(
+                    module.weight.shape[1])
+                if torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(local_sum, group=mpu.get_tensor_model_parallel_group())
+                    torch.distributed.all_reduce(local_count, group=mpu.get_tensor_model_parallel_group())
+                if local_count.item() <= 0:
+                    raise ValueError(f'No original vocab rows found for mean init in {key}')
+                mean_vec = local_sum / local_count.to(dtype=module.weight.dtype)
+                module.weight.data[initialize_mask] = mean_vec.unsqueeze(0).expand(num_to_initialize, -1)
+                logger.info_if(
+                    f'mean-initialized {num_to_initialize} rows in {key}; '
+                    f'original_vocab_size={original_vocab_size}, effective_vocab_size={effective_vocab_size}',
+                    cond=mpu.get_data_parallel_rank() == 0)
+            else:
+                tensor = module.weight.new_empty(num_to_initialize, module.weight.shape[1])
+                module.weight.data[initialize_mask] = init_method(tensor)
             if getattr(module.weight, 'main_param', None) is not None:
                 module.weight.main_param.copy_(module.weight.view(-1))
 
@@ -879,7 +983,6 @@ class BaseMegatronTrainer(ABC):
             micro_batch_size=args.micro_batch_size,
             forward_only=False,
         )
-
         update_successful, grad_norm, _ = self.optimizer.step()
         update_successful = logical_and_across_model_parallel_group(update_successful)
         grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
